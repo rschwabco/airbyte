@@ -1,4 +1,4 @@
-version: "0.1.0"
+version: "0.50.2"
 
 definitions:
 
@@ -41,7 +41,7 @@ definitions:
         inject_into: request_parameter
         field_name: per_page
       page_token_option:
-        type: RequestPath      
+        type: RequestPath
   requester_incremental_search:
     $ref: "#/definitions/requester"
     http_method: "POST"

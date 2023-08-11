@@ -2,24 +2,20 @@
 # Copyright (c) 2023 Airbyte, Inc., all rights reserved.
 #
 
-import os
 from dataclasses import InitVar, dataclass, field
-from functools import lru_cache, wraps
+from functools import wraps
 from time import sleep
-from typing import Any, Iterable, List, Mapping, MutableMapping, Optional, Union
+from typing import Any, Iterable, List, Mapping, Optional, Union
 
 import dpath.util
 import requests
 from airbyte_cdk.models import AirbyteMessage, SyncMode, Type
-from airbyte_cdk.sources.declarative.auth.declarative_authenticator import DeclarativeAuthenticator, NoAuth
+from airbyte_cdk.sources.declarative.incremental.cursor import Cursor
 from airbyte_cdk.sources.declarative.interpolation.interpolated_string import InterpolatedString
 from airbyte_cdk.sources.declarative.partition_routers.substream_partition_router import ParentStreamConfig
-from airbyte_cdk.sources.declarative.requesters.error_handlers.default_error_handler import DefaultErrorHandler
-from airbyte_cdk.sources.declarative.requesters.error_handlers.error_handler import ErrorHandler
 from airbyte_cdk.sources.declarative.requesters.error_handlers.response_status import ResponseStatus
+from airbyte_cdk.sources.declarative.requesters.http_requester import HttpRequester
 from airbyte_cdk.sources.declarative.requesters.request_option import RequestOptionType
-from airbyte_cdk.sources.declarative.requesters.request_options.interpolated_request_input_provider import InterpolatedRequestInputProvider
-from airbyte_cdk.sources.declarative.requesters.requester import HttpMethod, Requester
 from airbyte_cdk.sources.declarative.stream_slicers.stream_slicer import StreamSlicer
 from airbyte_cdk.sources.declarative.types import Config, Record, StreamSlice, StreamState
 from airbyte_cdk.sources.streams.core import Stream
@@ -28,7 +24,7 @@ RequestInput = Union[str, Mapping[str, str]]
 
 
 @dataclass
-class IncrementalSingleSlice(StreamSlicer):
+class IncrementalSingleSlice(Cursor):
 
     cursor_field: Union[InterpolatedString, str]
     config: Config
@@ -94,7 +90,7 @@ class IncrementalSingleSlice(StreamSlicer):
             cursor = last_record_value
         return cursor
 
-    def _set_initial_state(self, stream_slice: StreamSlice):
+    def set_initial_state(self, stream_slice: StreamSlice):
         self.initial_state = stream_slice if not self.initial_state else self.initial_state
 
     def _update_cursor_with_prior_state(self):
@@ -128,27 +124,43 @@ class IncrementalSingleSlice(StreamSlicer):
             ),
         )
 
-    def update_cursor(self, stream_slice: StreamSlice, last_record: Optional[Record] = None):
+    def close_slice(self, stream_slice: StreamSlice, most_recent_record: Optional[Record] = None):
         # freeze initial state
-        self._set_initial_state(stream_slice)
+        self.set_initial_state(stream_slice)
         # update the state of the child stream cursor_field value from previous sync,
         # and freeze it to have an ability to compare the record vs state
         self._update_cursor_with_prior_state()
-        self._update_stream_cursor(stream_slice, last_record)
+        self._update_stream_cursor(stream_slice, most_recent_record)
 
-    def stream_slices(self, sync_mode: SyncMode, stream_state: Mapping[str, Any]) -> Iterable[Mapping[str, Any]]:
+    def stream_slices(self) -> Iterable[Mapping[str, Any]]:
         yield {}
+
+    def should_be_synced(self, record: Record) -> bool:
+        cursor_field = self.cursor_field.eval(self.config)
+        record_cursor_value = record.get(cursor_field)
+        return bool(record_cursor_value)
+
+    def is_greater_than_or_equal(self, first: Record, second: Record) -> bool:
+        cursor_field = self.cursor_field.eval(self.config)
+        first_cursor_value = first.get(cursor_field)
+        second_cursor_value = second.get(cursor_field)
+        if first_cursor_value and second_cursor_value:
+            return first_cursor_value >= second_cursor_value
+        elif first_cursor_value:
+            return True
+        else:
+            return False
 
 
 @dataclass
-class IncrementalSubstreamSlicer(StreamSlicer):
+class IncrementalSubstreamSlicer(Cursor):
     """
     Like SubstreamSlicer, but works incrementaly with both parent and substream.
 
     Input Arguments:
 
     :: cursor_field: srt - substream cursor_field value
-    :: parent_complete_fetch: bool - If `True`, all slices is fetched into a list first, then yield.
+    :: parent_complete_fetch: bool - If `True`, all slices are fetched into a list first, then yield.
         If `False`, substream emits records on each parernt slice yield.
     :: parent_stream_configs: ParentStreamConfig - Describes how to create a stream slice from a parent stream.
 
@@ -225,7 +237,7 @@ class IncrementalSubstreamSlicer(StreamSlicer):
             cursor = last_record_value
         return cursor
 
-    def _set_initial_state(self, stream_slice: StreamSlice):
+    def set_initial_state(self, stream_slice: StreamSlice):
         self.initial_state = stream_slice if not self.initial_state else self.initial_state
 
     def _get_last_record_value(self, last_record: Optional[Record] = None, parent: Optional[bool] = False) -> Union[str, float, int]:
@@ -295,15 +307,15 @@ class IncrementalSubstreamSlicer(StreamSlicer):
     def get_stream_state(self) -> StreamState:
         return self._cursor if self._cursor else {}
 
-    def update_cursor(self, stream_slice: StreamSlice, last_record: Optional[Record] = None):
+    def close_slice(self, stream_slice: StreamSlice, most_recent_record: Optional[Record] = None):
         # freeze initial state
-        self._set_initial_state(stream_slice)
+        self.set_initial_state(stream_slice)
         # update the state of the child stream cursor_field value from previous sync,
         # and freeze it to have an ability to compare the record vs state
         self._update_cursor_with_prior_state()
         # we focus on updating the substream's cursor in this method,
         # the parent's cursor is updated while reading parent stream
-        self._update_substream_cursor(stream_slice, last_record)
+        self._update_substream_cursor(stream_slice, most_recent_record)
 
     def read_parent_stream(
         self, sync_mode: SyncMode, cursor_field: Optional[str], stream_state: Mapping[str, Any]
@@ -346,7 +358,7 @@ class IncrementalSubstreamSlicer(StreamSlicer):
             if empty_parent_slice:
                 yield from []
 
-    def stream_slices(self, sync_mode: SyncMode, stream_state: Mapping[str, Any]) -> Iterable[Mapping[str, Any]]:
+    def stream_slices(self) -> Iterable[Mapping[str, Any]]:
         stream_state = self.initial_state or {}
         parent_state = stream_state.get(self.parent_stream_name, {})
         parent_state.update(**{"prior_state": self._cursor.get("prior_state", {}).get(self.parent_stream_name, {})})
@@ -355,6 +367,28 @@ class IncrementalSubstreamSlicer(StreamSlicer):
             yield from [slice for slice in slices_generator]
         else:
             yield from slices_generator
+
+    def should_be_synced(self, record: Record) -> bool:
+        """
+        Evaluating if a record should be synced allows for filtering and stop condition on pagination
+        """
+        cursor_field = self.cursor_field.eval(self.config)
+        record_cursor_value = record.get(cursor_field)
+        return bool(record_cursor_value)
+
+    def is_greater_than_or_equal(self, first: Record, second: Record) -> bool:
+        """
+        Evaluating which record is greater in terms of cursor. This is used to avoid having to capture all the records to close a slice
+        """
+        cursor_field = self.cursor_field.eval(self.config)
+        first_cursor_value = first.get(cursor_field)
+        second_cursor_value = second.get(cursor_field)
+        if first_cursor_value and second_cursor_value:
+            return first_cursor_value >= second_cursor_value
+        elif first_cursor_value:
+            return True
+        else:
+            return False
 
 
 @dataclass
@@ -479,149 +513,18 @@ class IntercomRateLimiter:
         return decorator
 
 
-@dataclass
-class HttpRequesterWithRateLimiter(Requester):
+@dataclass(eq=False)
+class HttpRequesterWithRateLimiter(HttpRequester):
     """
     The difference between the built-in `HttpRequester` and this one is the custom decorator,
     applied on top of `interpret_response_status` to preserve the api calls for a defined amount of time,
     calculated using the rate limit headers and not use the custom backoff strategy,
     since we deal with Response.status_code == 200,
     the default requester's logic doesn't allow to handle the status of 200 with `should_retry()`.
-
-    Attributes:
-        name (str): Name of the stream. Only used for request/response caching
-        url_base (Union[InterpolatedString, str]): Base url to send requests to
-        path (Union[InterpolatedString, str]): Path to send requests to
-        http_method (Union[str, HttpMethod]): HTTP method to use when sending requests
-        request_options_provider (Optional[InterpolatedRequestOptionsProvider]): request option provider defining the options to set on outgoing requests
-        authenticator (DeclarativeAuthenticator): Authenticator defining how to authenticate to the source
-        error_handler (Optional[ErrorHandler]): Error handler defining how to detect and handle errors
-        config (Config): The user-provided configuration as specified by the source's spec
     """
 
-    name: str
-    url_base: Union[InterpolatedString, str]
-    path: Union[InterpolatedString, str]
-    config: Config
-    parameters: InitVar[Mapping[str, Any]]
-    http_method: Union[str, HttpMethod] = HttpMethod.GET
-    request_parameters: Optional[RequestInput] = None
-    request_headers: Optional[RequestInput] = None
-    request_body_data: Optional[RequestInput] = None
-    request_body_json: Optional[RequestInput] = None
-    authenticator: DeclarativeAuthenticator = None
-    error_handler: Optional[ErrorHandler] = None
-
-    def __post_init__(self, parameters: Mapping[str, Any]):
-        self.url_base = InterpolatedString.create(self.url_base, parameters=parameters)
-        self.path = InterpolatedString.create(self.path, parameters=parameters)
-
-        self.authenticator = self.authenticator or NoAuth(parameters=parameters)
-        if type(self.http_method) == str:
-            self.http_method = HttpMethod[self.http_method]
-        self._method = self.http_method
-        self.error_handler = self.error_handler or DefaultErrorHandler(parameters=parameters, config=self.config)
-        self._parameters = parameters
-
-        self.request_parameters = self.request_parameters if self.request_parameters else {}
-        self.request_headers = self.request_headers if self.request_headers else {}
-        self.request_body_data = self.request_body_data if self.request_body_data else {}
-        self.request_body_json = self.request_body_json if self.request_body_json else {}
-
-        if self.request_body_json and self.request_body_data:
-            raise ValueError("RequestOptionsProvider should only contain either 'request_body_data' or 'request_body_json' not both")
-
-        self._parameter_interpolator = InterpolatedRequestInputProvider(
-            config=self.config, request_inputs=self.request_parameters, parameters=parameters
-        )
-        self._headers_interpolator = InterpolatedRequestInputProvider(
-            config=self.config, request_inputs=self.request_headers, parameters=parameters
-        )
-        self._body_data_interpolator = InterpolatedRequestInputProvider(
-            config=self.config, request_inputs=self.request_body_data, parameters=parameters
-        )
-        self._body_json_interpolator = InterpolatedRequestInputProvider(
-            config=self.config, request_inputs=self.request_body_json, parameters=parameters
-        )
-
-    @property
-    def cache_filename(self) -> str:
-        return f"{self.name}.yml"
-
-    @property
-    def use_cache(self) -> bool:
-        return False
-
-    def __hash__(self):
-        return hash(tuple(self.__dict__))
-
-    def get_authenticator(self):
-        return self.authenticator
-
-    def get_url_base(self):
-        return os.path.join(self.url_base.eval(self.config), "")
-
-    def get_path(
-        self, *, stream_state: Optional[StreamState], stream_slice: Optional[StreamSlice], next_page_token: Optional[Mapping[str, Any]]
-    ) -> str:
-        kwargs = {"stream_state": stream_state, "stream_slice": stream_slice, "next_page_token": next_page_token}
-        path = self.path.eval(self.config, **kwargs)
-        return path.strip("/")
-
-    def get_method(self):
-        return self._method
-
     # The RateLimiter is applied to balance the api requests.
-    @lru_cache(maxsize=10)
     @IntercomRateLimiter.balance_rate_limit()
     def interpret_response_status(self, response: requests.Response) -> ResponseStatus:
         # Check for response.headers to define the backoff time before the next api call
-        return self.error_handler.interpret_response(response)
-
-    def get_request_params(
-        self,
-        *,
-        stream_state: Optional[StreamState] = None,
-        stream_slice: Optional[StreamSlice] = None,
-        next_page_token: Optional[Mapping[str, Any]] = None,
-    ) -> MutableMapping[str, Any]:
-        interpolated_value = self._parameter_interpolator.eval_request_inputs(stream_state, stream_slice, next_page_token)
-        if isinstance(interpolated_value, dict):
-            return interpolated_value
-        return {}
-
-    def get_request_headers(
-        self,
-        *,
-        stream_state: Optional[StreamState] = None,
-        stream_slice: Optional[StreamSlice] = None,
-        next_page_token: Optional[Mapping[str, Any]] = None,
-    ) -> Mapping[str, Any]:
-        return self._headers_interpolator.eval_request_inputs(stream_state, stream_slice, next_page_token)
-
-    def get_request_body_data(
-        self,
-        *,
-        stream_state: Optional[StreamState] = None,
-        stream_slice: Optional[StreamSlice] = None,
-        next_page_token: Optional[Mapping[str, Any]] = None,
-    ) -> Optional[Union[Mapping, str]]:
-        return self._body_data_interpolator.eval_request_inputs(stream_state, stream_slice, next_page_token)
-
-    def get_request_body_json(
-        self,
-        *,
-        stream_state: Optional[StreamState] = None,
-        stream_slice: Optional[StreamSlice] = None,
-        next_page_token: Optional[Mapping[str, Any]] = None,
-    ) -> Optional[Mapping]:
-        return self._body_json_interpolator.eval_request_inputs(stream_state, stream_slice, next_page_token)
-
-    def request_kwargs(
-        self,
-        *,
-        stream_state: Optional[StreamState] = None,
-        stream_slice: Optional[StreamSlice] = None,
-        next_page_token: Optional[Mapping[str, Any]] = None,
-    ) -> Mapping[str, Any]:
-        return {}
+        return super().interpret_response_status(response)
